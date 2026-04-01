@@ -77,6 +77,16 @@ async function initDB() {
       UNIQUE(week_id, player_id)
     )
   `);
+    await pool.query(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id SERIAL PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      active INTEGER DEFAULT 1
+    )
+  `);
+  await pool.query(`ALTER TABLE weeks ADD COLUMN IF NOT EXISTS home_team_id INTEGER`);
+  await pool.query(`ALTER TABLE weeks ADD COLUMN IF NOT EXISTS away_team_id INTEGER`);
   console.log("✅ Base de datos lista");
 }
 
@@ -155,7 +165,7 @@ app.post("/reorder-players", async (req, res) => {
 
 // ===================== WEEKS =====================
 app.post("/new-week", async (req, res) => {
-  const { match, match_date, round_number, excluded_players } = req.body;
+  const { match, match_date, round_number, excluded_players, home_team_id, away_team_id } = req.body;
   if (!match?.trim()) return res.status(400).json({ error: "Partido inválido" });
   try {
     const { rows } = await pool.query("SELECT next_pot FROM weeks WHERE finished = 1 ORDER BY id DESC LIMIT 1");
@@ -163,8 +173,8 @@ app.post("/new-week", async (req, res) => {
     const now = new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid" });
     const excludedStr = Array.isArray(excluded_players) ? excluded_players.join(",") : (excluded_players || "");
     await pool.query(
-      "INSERT INTO weeks (match, match_date, created_at, pot, finished, round_number, excluded_players) VALUES ($1, $2, $3, $4, 0, $5, $6)",
-      [match.trim(), match_date || null, now, pot, round_number || null, excludedStr]
+      "INSERT INTO weeks (match, match_date, created_at, pot, finished, round_number, excluded_players, home_team_id, away_team_id) VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8)",
+      [match.trim(), match_date || null, now, pot, round_number || null, excludedStr, home_team_id || null, away_team_id || null]
     );
     res.json({ success: true });
   } catch (err) {
@@ -174,17 +184,20 @@ app.post("/new-week", async (req, res) => {
 
 app.get("/current-week", async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM weeks WHERE finished = 0 ORDER BY id DESC LIMIT 1");
-  res.json(rows[0] || null);
+  if (rows[0]) return res.json(rows[0]);
+  // No active week — return pending pot from last finished week
+  const { rows: lastRows } = await pool.query("SELECT next_pot FROM weeks WHERE finished = 1 ORDER BY id DESC LIMIT 1");
+  res.json({ none: true, pending_pot: lastRows[0]?.next_pot || 0 });
 });
 
 app.post("/edit-week", async (req, res) => {
-  const { week_id, match, match_date, round_number, excluded_players } = req.body;
+  const { week_id, match, match_date, round_number, excluded_players, home_team_id, away_team_id } = req.body;
   if (!week_id || !match?.trim()) return res.status(400).json({ error: "Datos inválidos" });
   try {
     const excludedStr = Array.isArray(excluded_players) ? excluded_players.join(",") : (excluded_players || "");
     const { rowCount } = await pool.query(
-      "UPDATE weeks SET match = $1, match_date = $2, round_number = $3, excluded_players = $4 WHERE id = $5 AND finished = 0",
-      [match.trim(), match_date || null, round_number || null, excludedStr, week_id]
+      "UPDATE weeks SET match = $1, match_date = $2, round_number = $3, excluded_players = $4, home_team_id = $5, away_team_id = $6 WHERE id = $7 AND finished = 0",
+      [match.trim(), match_date || null, round_number || null, excludedStr, home_team_id || null, away_team_id || null, week_id]
     );
     if (rowCount === 0) return res.status(404).json({ error: "Semana no encontrada o ya cerrada" });
     await pool.query("DELETE FROM predictions WHERE week_id = $1", [week_id]);
@@ -244,39 +257,49 @@ app.post("/close-week", async (req, res) => {
   const amountPerPerson = (weekly_amount !== undefined && weekly_amount !== "" && weekly_amount !== null && !isNaN(parseInt(weekly_amount)))
     ? parseInt(weekly_amount) : 1;
 
+  const client = await pool.connect();
   try {
-    const { rows: weekRows } = await pool.query("SELECT * FROM weeks WHERE id = $1", [week_id]);
-    if (!weekRows.length) return res.status(404).json({ message: "Semana no encontrada" });
+    await client.query("BEGIN");
+
+    // Lock the row — si otra transacción ya la está cerrando, esto espera o falla
+    const { rows: weekRows } = await client.query("SELECT * FROM weeks WHERE id = $1 AND finished = 0 FOR UPDATE", [week_id]);
+    if (!weekRows.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "La semana ya fue cerrada o no existe" });
+    }
     const week = weekRows[0];
     const excludedIds = week.excluded_players ? week.excluded_players.split(",").filter(Boolean).map(Number) : [];
 
     // Only count active, non-excluded players for pot
-    const { rows: activePlayers } = await pool.query(
+    const { rows: activePlayers } = await client.query(
       "SELECT * FROM players WHERE active = 1 AND id != ALL($1) ORDER BY order_position ASC",
       [excludedIds.length ? excludedIds : [0]]
     );
     const totalPlayers = activePlayers.length;
     const newPot = (week.pot || 0) + amountPerPerson * totalPlayers;
 
-    const { rows: preds } = await pool.query("SELECT * FROM predictions WHERE week_id = $1", [week_id]);
+    const { rows: preds } = await client.query("SELECT * FROM predictions WHERE week_id = $1", [week_id]);
     const winners = preds.filter(p => p.result === real_result.trim());
     const hasWinner = winners.length > 0;
     const nextPot = hasWinner ? 0 : newPot;
 
-    await pool.query(
+    await client.query(
       "UPDATE weeks SET real_result = $1, weekly_amount = $2, pot = $3, next_pot = $4, finished = 1 WHERE id = $5",
       [real_result.trim(), amountPerPerson, newPot, nextPot, week_id]
     );
 
     // Rotación: solo entre jugadores activos no excluidos
-    const { rows: allActivePlayers } = await pool.query(
+    const { rows: allActivePlayers } = await client.query(
       "SELECT * FROM players WHERE active = 1 AND id != ALL($1) ORDER BY order_position ASC",
       [excludedIds.length ? excludedIds : [0]]
     );
     const newOrder = [...allActivePlayers.slice(1), allActivePlayers[0]];
     for (let i = 0; i < newOrder.length; i++) {
-      await pool.query("UPDATE players SET order_position = $1 WHERE id = $2", [i + 1, newOrder[i].id]);
+      await client.query("UPDATE players SET order_position = $1 WHERE id = $2", [i + 1, newOrder[i].id]);
     }
+
+    await client.query("COMMIT");
+    client.release();
 
     if (hasWinner) {
       const { rows: allPlayers } = await pool.query("SELECT * FROM players");
@@ -286,6 +309,8 @@ app.post("/close-week", async (req, res) => {
       res.json({ message: `❌ Nadie acertó. El bote sube a ${newPot}€`, winners: null, pot: newPot });
     }
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
     res.status(500).json({ message: err.message });
   }
 });
@@ -293,16 +318,57 @@ app.post("/close-week", async (req, res) => {
 // ===================== HISTORY =====================
 app.get("/history", async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT w.*, STRING_AGG(p.name, ',') as winners
+    const { rows: weeks } = await pool.query(`
+      SELECT w.*, STRING_AGG(DISTINCT p.name, ',') as winners
       FROM weeks w
       LEFT JOIN predictions pr ON pr.week_id = w.id AND pr.result = w.real_result
       LEFT JOIN players p ON p.id = pr.player_id
       WHERE w.finished = 1
       GROUP BY w.id
-      ORDER BY w.id DESC LIMIT 30
+      ORDER BY w.id DESC LIMIT 50
     `);
-    res.json(rows);
+
+    const { rows: allPlayers } = await pool.query("SELECT * FROM players ORDER BY order_position ASC");
+    let allPayments = [];
+    try {
+      const { rows } = await pool.query("SELECT * FROM payments");
+      allPayments = rows;
+    } catch {}
+
+    const result = [];
+    for (const w of weeks) {
+      const { rows: preds } = await pool.query(`
+        SELECT pr.*, p.name as player_name
+        FROM predictions pr
+        JOIN players p ON p.id = pr.player_id
+        WHERE pr.week_id = $1
+        ORDER BY pr.id ASC
+      `, [w.id]);
+
+      const excludedIds = w.excluded_players ? w.excluded_players.split(",").filter(Boolean).map(Number) : [];
+      const excludedNames = excludedIds.map(id => allPlayers.find(p => p.id === id)?.name).filter(Boolean);
+      const activePlayers = allPlayers.filter(p => p.active && !excludedIds.includes(p.id));
+      const weekPayments = allPayments.filter(p => p.week_id === w.id);
+      const payments = activePlayers.map(p => ({
+        player_id: p.id,
+        name: p.name,
+        paid: weekPayments.some(pay => pay.player_id === p.id && pay.paid)
+      }));
+
+      result.push({
+        ...w,
+        predictions: preds.map((pr, i) => ({
+          order: i + 1,
+          player_name: pr.player_name,
+          result: pr.result,
+          correct: pr.result === w.real_result
+        })),
+        excluded: excludedNames,
+        payments
+      });
+    }
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -358,53 +424,6 @@ app.get("/rankings", async (req, res) => {
   }
 });
 
-// ===================== WEEK DETAIL LOG =====================
-app.get("/week-log", async (req, res) => {
-  try {
-    const { rows: weeks } = await pool.query(
-      "SELECT * FROM weeks WHERE finished = 1 ORDER BY id DESC LIMIT 50"
-    );
-    const { rows: allPlayers } = await pool.query("SELECT * FROM players ORDER BY order_position ASC");
-
-    const result = [];
-    for (const w of weeks) {
-      const { rows: preds } = await pool.query(`
-        SELECT pr.*, p.name as player_name
-        FROM predictions pr
-        JOIN players p ON p.id = pr.player_id
-        WHERE pr.week_id = $1
-        ORDER BY pr.id ASC
-      `, [w.id]);
-
-      const excludedIds = w.excluded_players
-        ? w.excluded_players.split(",").filter(Boolean).map(Number)
-        : [];
-      const excludedNames = excludedIds
-        .map(id => allPlayers.find(p => p.id === id)?.name)
-        .filter(Boolean);
-
-      result.push({
-        id: w.id,
-        match: w.match,
-        round_number: w.round_number,
-        match_date: w.match_date,
-        real_result: w.real_result,
-        pot: w.pot,
-        weekly_amount: w.weekly_amount,
-        excluded: excludedNames,
-        predictions: preds.map((pr, i) => ({
-          order: i + 1,
-          player_name: pr.player_name,
-          result: pr.result,
-          correct: pr.result === w.real_result
-        }))
-      });
-    }
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ===================== PAYMENTS =====================
 app.get("/payments/:week_id", async (req, res) => {
@@ -449,7 +468,9 @@ app.get("/api/export", async (req, res) => {
     const { rows: players } = await pool.query("SELECT * FROM players ORDER BY order_position ASC");
     const { rows: weeks } = await pool.query("SELECT * FROM weeks ORDER BY id ASC");
     const { rows: predictions } = await pool.query("SELECT * FROM predictions ORDER BY id ASC");
-    const backup = { exported_at: new Date().toISOString(), version: 1, players, weeks, predictions };
+    const { rows: teams } = await pool.query("SELECT * FROM teams ORDER BY id ASC");
+    const { rows: payments } = await pool.query("SELECT * FROM payments ORDER BY id ASC").catch(() => ({ rows: [] }));
+    const backup = { exported_at: new Date().toISOString(), version: 1, players, weeks, predictions, teams, payments };
     const filename = `porrids_backup_${new Date().toISOString().slice(0, 10)}.json`;
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Type", "application/json");
@@ -460,31 +481,54 @@ app.get("/api/export", async (req, res) => {
 });
 
 app.post("/api/import", async (req, res) => {
-  const { players, weeks, predictions } = req.body;
+  const { players, weeks, predictions, teams, payments } = req.body;
   if (!players || !weeks || !predictions) return res.status(400).json({ error: "JSON inválido: faltan datos" });
   try {
     await pool.query("DELETE FROM predictions");
+    await pool.query("DELETE FROM payments").catch(() => {});
     await pool.query("DELETE FROM weeks");
     await pool.query("DELETE FROM players");
+    await pool.query("DELETE FROM teams");
 
     for (const p of players) {
-      await pool.query("INSERT INTO players (id, name, order_position) VALUES ($1, $2, $3)", [p.id, p.name, p.order_position]);
+      await pool.query("INSERT INTO players (id, name, order_position, active) VALUES ($1, $2, $3, $4)", [p.id, p.name, p.order_position, p.active ?? 1]);
     }
     for (const w of weeks) {
       await pool.query(
-        "INSERT INTO weeks (id, match, match_date, created_at, real_result, pot, next_pot, weekly_amount, finished) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-        [w.id, w.match, w.match_date || null, w.created_at || null, w.real_result || null, w.pot || 0, w.next_pot || 0, w.weekly_amount || 0, w.finished || 0]
+        "INSERT INTO weeks (id, match, match_date, created_at, real_result, pot, next_pot, weekly_amount, finished, round_number, excluded_players, home_team_id, away_team_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        [w.id, w.match, w.match_date || null, w.created_at || null, w.real_result || null, w.pot || 0, w.next_pot || 0, w.weekly_amount || 0, w.finished || 0, w.round_number || null, w.excluded_players || '', w.home_team_id || null, w.away_team_id || null]
       );
     }
     for (const p of predictions) {
       await pool.query("INSERT INTO predictions (id, week_id, player_id, result) VALUES ($1, $2, $3, $4)", [p.id, p.week_id, p.player_id, p.result]);
+    }
+    if (teams?.length) {
+      for (const t of teams) {
+        await pool.query("INSERT INTO teams (id, slug, name, active) VALUES ($1, $2, $3, $4)", [t.id, t.slug, t.name, t.active ?? 1]);
+      }
+      await pool.query("SELECT setval('teams_id_seq', (SELECT MAX(id) FROM teams))");
+    }
+    if (payments?.length) {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS payments (
+          id SERIAL PRIMARY KEY,
+          week_id INTEGER,
+          player_id INTEGER,
+          paid INTEGER DEFAULT 0,
+          UNIQUE(week_id, player_id)
+        )
+      `);
+      for (const p of payments) {
+        await pool.query("INSERT INTO payments (id, week_id, player_id, paid) VALUES ($1, $2, $3, $4)", [p.id, p.week_id, p.player_id, p.paid ?? 0]);
+      }
+      await pool.query("SELECT setval('payments_id_seq', (SELECT MAX(id) FROM payments))");
     }
 
     await pool.query("SELECT setval('players_id_seq', (SELECT MAX(id) FROM players))");
     await pool.query("SELECT setval('weeks_id_seq', (SELECT MAX(id) FROM weeks))");
     await pool.query("SELECT setval('predictions_id_seq', (SELECT MAX(id) FROM predictions))");
 
-    res.json({ success: true, message: `Importados: ${players.length} jugadores, ${weeks.length} semanas, ${predictions.length} apuestas` });
+    res.json({ success: true, message: `Importados: ${players.length} jugadores, ${weeks.length} semanas, ${predictions.length} apuestas, ${teams?.length || 0} equipos, ${payments?.length || 0} pagos` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -493,11 +537,84 @@ app.post("/api/import", async (req, res) => {
 app.post("/api/reset", async (req, res) => {
   try {
     await pool.query("DELETE FROM predictions");
+    await pool.query("DELETE FROM payments").catch(() => {});
     await pool.query("DELETE FROM weeks");
     await pool.query("DELETE FROM players");
+    await pool.query("DELETE FROM teams");
     await pool.query("ALTER SEQUENCE players_id_seq RESTART WITH 1");
     await pool.query("ALTER SEQUENCE weeks_id_seq RESTART WITH 1");
     await pool.query("ALTER SEQUENCE predictions_id_seq RESTART WITH 1");
+    await pool.query("ALTER SEQUENCE teams_id_seq RESTART WITH 1");
+    await pool.query("ALTER SEQUENCE payments_id_seq RESTART WITH 1").catch(() => {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ===================== TEAMS =====================
+app.get("/teams", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM teams ORDER BY name ASC");
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/add-team", async (req, res) => {
+  const { slug, name } = req.body;
+  if (!slug?.trim() || !name?.trim()) return res.status(400).json({ error: "Datos inválidos" });
+  try {
+    await pool.query("INSERT INTO teams (slug, name, active) VALUES ($1, $2, 1)", [slug.trim().toLowerCase(), name.trim()]);
+    res.json({ success: true });
+  } catch {
+    res.status(400).json({ error: "Equipo ya existe" });
+  }
+});
+
+app.post("/deactivate-team", async (req, res) => {
+  const { team_id } = req.body;
+  if (!team_id) return res.status(400).json({ error: "ID requerido" });
+  try {
+    await pool.query("UPDATE teams SET active = 0 WHERE id = $1", [team_id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/reactivate-team", async (req, res) => {
+  const { team_id } = req.body;
+  if (!team_id) return res.status(400).json({ error: "ID requerido" });
+  try {
+    await pool.query("UPDATE teams SET active = 1 WHERE id = $1", [team_id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/edit-team", async (req, res) => {
+  const { team_id, name } = req.body;
+  if (!team_id || !name?.trim()) return res.status(400).json({ error: "Datos inválidos" });
+  try {
+    const { rowCount } = await pool.query("UPDATE teams SET name = $1 WHERE id = $2", [name.trim(), team_id]);
+    if (rowCount === 0) return res.status(404).json({ error: "Equipo no encontrado" });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/delete-team", async (req, res) => {
+  const { team_id } = req.body;
+  if (!team_id) return res.status(400).json({ error: "ID requerido" });
+  try {
+    await pool.query("UPDATE weeks SET home_team_id = NULL WHERE home_team_id = $1", [team_id]);
+    await pool.query("UPDATE weeks SET away_team_id = NULL WHERE away_team_id = $1", [team_id]);
+    await pool.query("DELETE FROM teams WHERE id = $1", [team_id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
