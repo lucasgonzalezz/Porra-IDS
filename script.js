@@ -5,10 +5,14 @@ let predictions = [];
 let currentTurnPlayer = null;
 let historyVisible = false;
 let rankingsData = [];
+let allHistoryData = [];
 let currentTab = "wins";
+let currentSeason = "all";
 let payments = [];
 let newExcludedPlayers = [];
+let showActiveOnly = true;
 let editExcludedPlayers = [];
+let teams = [];
 
 // ===================== INIT =====================
 let isRedirecting = false;
@@ -32,17 +36,19 @@ let isRedirecting = false;
 
 async function loadData() {
   await loadPlayers();
+  await loadTeams();
   await loadWeek();
   await loadPredictions();
   await loadPayments();
+  reorderList = []; // reset so renderReorder picks up fresh DB order
   calculateTurn();
   renderPlayers();
   renderReorder();
   renderManagePlayers();
   renderExcludeLists();
   await loadRankings();
+  await loadHistory();
   document.getElementById("playersCount").textContent = players.filter(p => p.active).length;
-  if (historyVisible) loadHistory();
 }
 
 // ===================== FETCH =====================
@@ -80,17 +86,36 @@ async function loadPlayers() {
 async function loadWeek() {
   currentWeek = await api("/current-week");
 
-  if (!currentWeek) {
+  if (!currentWeek || currentWeek.none) {
     document.getElementById("weekInfo").textContent = "Sin semana activa";
-    document.getElementById("potInfo").textContent = "";
     document.getElementById("weekDatetime").textContent = "";
     document.getElementById("weekStatus").textContent = "Crea una nueva semana desde Admin";
     document.getElementById("weekRound").textContent = "";
     document.getElementById("turnBanner").classList.add("hidden");
+    const pendingPot = currentWeek?.pending_pot || 0;
+    const potEl = document.getElementById("potInfo");
+    if (pendingPot > 0) {
+      potEl.innerHTML = `<span class="pot-pending">💰 Bote acumulado: <strong>${pendingPot}€</strong></span>`;
+    } else {
+      potEl.textContent = "";
+    }
+    currentWeek = null;
     return;
   }
 
-  document.getElementById("weekInfo").textContent = currentWeek.match;
+  const homeTeam = teams.find(t => t.id === currentWeek.home_team_id);
+  const awayTeam = teams.find(t => t.id === currentWeek.away_team_id);
+  const weekInfoEl = document.getElementById("weekInfo");
+  if (homeTeam && awayTeam) {
+    weekInfoEl.innerHTML = `
+      <span class="scoreboard-teams">
+        <img src="/Escudos/${homeTeam.slug}.svg" class="scoreboard-badge" onerror="this.style.display='none'">
+        <span class="scoreboard-vs">VS</span>
+        <img src="/Escudos/${awayTeam.slug}.svg" class="scoreboard-badge" onerror="this.style.display='none'">
+      </span>`;
+  } else {
+    weekInfoEl.textContent = currentWeek.match;
+  }
   document.getElementById("potInfo").textContent =
     currentWeek.pot > 0 ? `💰 Bote: ${currentWeek.pot} €` : "";
   document.getElementById("weekStatus").textContent = "SEMANA EN CURSO";
@@ -127,6 +152,153 @@ async function loadPayments() {
   payments = await api("/payments/" + currentWeek.id).catch(() => []);
 }
 
+// ===================== TEAMS =====================
+async function loadTeams() {
+  teams = await api("/teams");
+}
+
+function teamBadge(slug, size = 28) {
+  if (!slug) return "";
+  return `<img src="/Escudos/${slug}.svg" width="${size}" height="${size}" loading="lazy" decoding="async" style="vertical-align:middle;object-fit:contain;margin:0 2px" onerror="this.style.display='none'">`;
+}
+
+function renderTeamSelectors(homeId, awayId, homeVal, awayVal) {
+  const active = teams.filter(t => t.active);
+  [homeId, awayId].forEach((id, idx) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const val = idx === 0 ? homeVal : awayVal;
+    sel.innerHTML = (idx === 0 ? `<option value="">— Local —</option>` : `<option value="">— Visitante —</option>`) +
+      active.map(t => `<option value="${t.id}" ${t.id == val ? "selected" : ""}>${t.name}</option>`).join("");
+    sel.onchange = () => {
+      const prefix = id.startsWith("new") ? "new" : "edit";
+      const hId = parseInt(document.getElementById(prefix + "HomeTeam")?.value);
+      const aId = parseInt(document.getElementById(prefix + "AwayTeam")?.value);
+      const h = teams.find(t => t.id === hId);
+      const a = teams.find(t => t.id === aId);
+      const inp = document.getElementById(prefix + "Match");
+      if (inp && h && a) inp.value = `${h.name}-${a.name}`;
+    };
+  });
+}
+
+function renderManageTeams() {
+  const container = document.getElementById("manageTeamsList");
+  if (!container) return;
+  container.innerHTML = "";
+  if (!teams.length) {
+    container.innerHTML = '<p class="empty-state">No hay equipos.</p>';
+    return;
+  }
+  const sorted = [...teams].sort((a, b) => (b.active - a.active) || a.name.localeCompare(b.name));
+  sorted.forEach(t => {
+    const div = document.createElement("div");
+    div.className = "manage-player-item" + (t.active ? "" : " inactive");
+    div.innerHTML = `
+      <span class="manage-player-name">
+        ${teamBadge(t.slug, 22)} ${t.name}
+        ${!t.active ? '<span class="inactive-tag">inactivo</span>' : ""}
+      </span>
+      <div style="display:flex;gap:6px">
+        <button type="button" class="btn-move" onclick="startEditTeam(${t.id}, '${t.name}')" title="Editar nombre">✏️</button>
+        ${t.active
+          ? `<button type="button" class="btn-deactivate" onclick="deactivateTeam(${t.id}, '${t.name}')">Descender</button>`
+          : `<button type="button" class="btn-reactivate" onclick="reactivateTeam(${t.id}, '${t.name}')">Ascender</button>`
+        }
+        <button type="button" class="btn-deactivate" onclick="deleteTeam(${t.id}, '${t.name}')" title="Eliminar definitivamente" style="background:rgba(244,67,54,0.15);border-color:rgba(244,67,54,0.4);color:#f44336">🗑</button>
+      </div>
+    `;
+    container.appendChild(div);
+  });
+}
+
+async function addTeam() {
+  const slug = document.getElementById("newTeamSlug")?.value.trim().toLowerCase();
+  const name = document.getElementById("newTeamName")?.value.trim();
+  if (!slug || !name) return toast("Rellena acrónimo y nombre", "error");
+  const res = await post("/add-team", { slug, name });
+  if (res.error) { toast(res.error, "error"); return; }
+  toast(`✓ ${name} añadido`, "success");
+  document.getElementById("newTeamSlug").value = "";
+  document.getElementById("newTeamName").value = "";
+  await loadTeams();
+  renderManageTeams();
+  renderTeamSelectors("newHomeTeam", "newAwayTeam");
+  renderTeamSelectors("editHomeTeam", "editAwayTeam", currentWeek?.home_team_id, currentWeek?.away_team_id);
+}
+
+async function deactivateTeam(id, name) {
+  showModal({
+    icon: "⬇️",
+    title: "¿Descender equipo?",
+    body: `<strong>${name}</strong> quedará inactivo. Puedes reactivarlo si sube.`,
+    confirmText: "Descender",
+    danger: true,
+    onConfirm: async () => {
+      const res = await post("/deactivate-team", { team_id: id });
+      if (res.error) { toast(res.error, "error"); return; }
+      toast(`${name} descendido`, "info");
+      await loadTeams(); renderManageTeams();
+    }
+  });
+}
+
+function startEditTeam(id, currentName) {
+  showModal({
+    icon: "✏️",
+    title: "Editar nombre del equipo",
+    body: `<input type="text" id="editTeamNameInput" value="${currentName}" style="width:100%;margin-top:8px" placeholder="Nuevo nombre">`,
+    confirmText: "Guardar",
+    danger: false,
+    onConfirm: async () => {
+      const name = document.getElementById("editTeamNameInput")?.value.trim();
+      if (!name) return toast("El nombre no puede estar vacío", "error");
+      const res = await post("/edit-team", { team_id: id, name });
+      if (res.error) { toast(res.error, "error"); return; }
+      toast(`✓ Nombre actualizado`, "success");
+      await loadTeams();
+      renderManageTeams();
+      renderTeamSelectors("newHomeTeam", "newAwayTeam");
+      renderTeamSelectors("editHomeTeam", "editAwayTeam", currentWeek?.home_team_id, currentWeek?.away_team_id);
+    }
+  });
+}
+
+async function reactivateTeam(id, name) {
+  showModal({
+    icon: "⬆️",
+    title: "¿Ascender equipo?",
+    body: `<strong>${name}</strong> volverá a estar disponible.`,
+    confirmText: "Ascender",
+    danger: false,
+    onConfirm: async () => {
+      const res = await post("/reactivate-team", { team_id: id });
+      if (res.error) { toast(res.error, "error"); return; }
+      toast(`${name} ascendido ✓`, "success");
+      await loadTeams(); renderManageTeams();
+    }
+  });
+}
+
+async function deleteTeam(id, name) {
+  showModal({
+    icon: "🗑️",
+    title: "¿Eliminar equipo?",
+    body: `Se eliminará <strong>${name}</strong> definitivamente de la base de datos.<br><br>Los partidos que lo usaban quedarán sin escudo asignado.`,
+    confirmText: "Eliminar",
+    danger: true,
+    onConfirm: async () => {
+      const res = await post("/delete-team", { team_id: id });
+      if (res.error) { toast(res.error, "error"); return; }
+      toast(`${name} eliminado`, "info");
+      await loadTeams();
+      renderManageTeams();
+      renderTeamSelectors("newHomeTeam", "newAwayTeam");
+      renderTeamSelectors("editHomeTeam", "editAwayTeam", currentWeek?.home_team_id, currentWeek?.away_team_id);
+    }
+  });
+}
+
 // ===================== EXCLUDED PLAYERS HELPERS =====================
 function getExcludedForCurrentWeek() {
   if (!currentWeek || !currentWeek.excluded_players) return [];
@@ -153,15 +325,15 @@ function calculateTurn() {
     return;
   }
 
-  const allPlayed = activePlayers.every(p => predictions.find(pr => pr.player_id === p.id));
-  if (allPlayed) {
-    currentTurnPlayer = null;
+  const playerIdsWhoBet = new Set(predictions.map(pr => pr.player_id));
+  currentTurnPlayer = activePlayers.find(p => !playerIdsWhoBet.has(p.id)) || null;
+
+  if (!currentTurnPlayer) {
     document.getElementById("currentTurnName").textContent = "Todos han apostado";
+    document.getElementById("shareContainer")?.classList.remove("hidden");
     return;
   }
-
-  const turnIndex = predictions.length % activePlayers.length;
-  currentTurnPlayer = activePlayers[turnIndex];
+  document.getElementById("shareContainer")?.classList.add("hidden");
   document.getElementById("currentTurnName").textContent = currentTurnPlayer.name.toUpperCase();
 }
 
@@ -294,7 +466,8 @@ function renderManagePlayers() {
     return;
   }
 
-  players.forEach(p => {
+  const sortedPlayers = [...players].sort((a, b) => (b.active - a.active) || a.order_position - b.order_position || a.id - b.id);
+  sortedPlayers.forEach(p => {
     const div = document.createElement("div");
     div.className = "manage-player-item" + (p.active ? "" : " inactive");
     div.innerHTML = `
@@ -341,50 +514,61 @@ async function reactivatePlayer(id, name) {
 }
 
 // ===================== RENDER REORDER =====================
+// Orden visual local (array de ids) — independiente de order_position en BD
+let reorderList = [];
+
 function renderReorder() {
   const container = document.getElementById("reorderList");
   container.innerHTML = "";
-  const activePlayers = players.filter(p => p.active).sort((a, b) => a.order_position - b.order_position);
 
-  activePlayers.forEach((p, i) => {
+  // Inicializar reorderList si está vacío o desactualizado
+  const activePlayers = players.filter(p => p.active);
+  if (!reorderList.length || !reorderList.every(id => activePlayers.find(p => p.id === id))) {
+    reorderList = [...activePlayers].sort((a, b) => a.order_position - b.order_position || a.id - b.id).map(p => p.id);
+  }
+
+  reorderList.forEach((id, i) => {
+    const p = players.find(pl => pl.id === id);
+    if (!p) return;
     const div = document.createElement("div");
     div.className = "reorder-item";
     div.innerHTML = `
       <span class="reorder-pos">${i + 1}</span>
       <span class="reorder-name">${p.name}</span>
-      <button type="button" class="btn-move" onclick="moveUp(${p.id})">▲</button>
-      <button type="button" class="btn-move" onclick="moveDown(${p.id})">▼</button>
+      <button type="button" class="btn-move" onclick="moveUp(${id})">▲</button>
+      <button type="button" class="btn-move" onclick="moveDown(${id})">▼</button>
     `;
     container.appendChild(div);
   });
 }
 
 function moveUp(id) {
-  const activePlayers = players.filter(p => p.active).sort((a, b) => a.order_position - b.order_position);
-  const index = activePlayers.findIndex(p => p.id === id);
+  const index = reorderList.indexOf(id);
   if (index > 0) {
-    [activePlayers[index].order_position, activePlayers[index - 1].order_position] =
-      [activePlayers[index - 1].order_position, activePlayers[index].order_position];
-    players.sort((a, b) => a.order_position - b.order_position);
-    renderReorder(); renderPlayers();
+    [reorderList[index], reorderList[index - 1]] = [reorderList[index - 1], reorderList[index]];
+    renderReorder();
   }
 }
 
 function moveDown(id) {
-  const activePlayers = players.filter(p => p.active).sort((a, b) => a.order_position - b.order_position);
-  const index = activePlayers.findIndex(p => p.id === id);
-  if (index < activePlayers.length - 1) {
-    [activePlayers[index].order_position, activePlayers[index + 1].order_position] =
-      [activePlayers[index + 1].order_position, activePlayers[index].order_position];
-    players.sort((a, b) => a.order_position - b.order_position);
-    renderReorder(); renderPlayers();
+  const index = reorderList.indexOf(id);
+  if (index < reorderList.length - 1) {
+    [reorderList[index], reorderList[index + 1]] = [reorderList[index + 1], reorderList[index]];
+    renderReorder();
   }
 }
 
 async function saveOrder() {
-  const orders = players.filter(p => p.active).map(p => ({ id: p.id, order_position: p.order_position }));
+  // Reasignar order_position consecutivos según el orden visual actual
+  const orders = reorderList.map((id, i) => ({ id, order_position: i + 1 }));
+  // Actualizar también el array local
+  orders.forEach(o => {
+    const p = players.find(pl => pl.id === o.id);
+    if (p) p.order_position = o.order_position;
+  });
   await post("/reorder-players", { orders });
   toast("Orden guardado ✓", "success");
+  reorderList = [];
   loadData();
 }
 
@@ -441,7 +625,9 @@ async function createWeek() {
   const match_date = document.getElementById("newMatchDate").value || null;
   const round_number = document.getElementById("newRound").value.trim() || null;
 
-  const data = await post("/new-week", { match, match_date, round_number, excluded_players: newExcludedPlayers });
+  const home_team_id = parseInt(document.getElementById("newHomeTeam")?.value) || null;
+  const away_team_id = parseInt(document.getElementById("newAwayTeam")?.value) || null;
+  const data = await post("/new-week", { match, match_date, round_number, excluded_players: newExcludedPlayers, home_team_id, away_team_id });
   if (data.error) { toast(data.error, "error"); return; }
   toast("✓ Semana creada", "success");
   document.getElementById("newMatch").value = "";
@@ -466,9 +652,11 @@ function editWeek() {
     confirmText: "Sí, editar y borrar apuestas",
     danger: true,
     onConfirm: async () => {
+      const home_team_id = parseInt(document.getElementById("editHomeTeam")?.value) || null;
+      const away_team_id = parseInt(document.getElementById("editAwayTeam")?.value) || null;
       const data = await post("/edit-week", {
         week_id: currentWeek.id, match, match_date, round_number,
-        excluded_players: editExcludedPlayers
+        excluded_players: editExcludedPlayers, home_team_id, away_team_id
       });
       if (data.error) { toast(data.error, "error"); return; }
       toast("✓ Partido actualizado y apuestas reiniciadas", "info");
@@ -518,24 +706,106 @@ async function closeWeek() {
   payments = [];
   toggleAdmin();
   loadData();
-  if (historyVisible) loadHistory();
+
 }
 
 // ===================== HISTORY =====================
-async function toggleHistory() {
-  historyVisible = !historyVisible;
-  const container = document.getElementById("historyList");
-  if (historyVisible) {
-    container.classList.remove("hidden");
-    loadHistory();
-  } else {
-    container.classList.add("hidden");
-  }
+
+
+
+// ===================== SEASONS =====================
+function getSeason(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d)) return null;
+  const year = d.getFullYear();
+  const month = d.getMonth() + 1; // 1-12
+  return month >= 8 ? `${year}/${year + 1}` : `${year - 1}/${year}`;
+}
+
+function getSeasons(weeks) {
+  const seasons = new Set();
+  weeks.forEach(w => {
+    const s = getSeason(w.match_date || w.created_at);
+    if (s) seasons.add(s);
+  });
+  return [...seasons].sort().reverse();
+}
+
+function renderSeasonFilter(weeks) {
+  const seasons = getSeasons(weeks);
+  const container = document.getElementById("seasonFilter");
+  if (!container) return;
+  container.innerHTML = "";
+
+  const label = document.createElement("span");
+  label.className = "season-label";
+  label.textContent = "⚽ Temporada:";
+  container.appendChild(label);
+
+  const sel = document.createElement("select");
+  sel.className = "season-select";
+  sel.innerHTML = '<option value="all">Todas</option>' +
+    seasons.map(s => '<option value="' + s + '"' + (currentSeason === s ? ' selected' : '') + '>' + s + '</option>').join("");
+  sel.value = currentSeason;
+  sel.onchange = () => { currentSeason = sel.value; applySeasonFilter(); };
+  container.appendChild(sel);
+}
+
+function filterWeeksBySeason(weeks) {
+  if (currentSeason === "all") return weeks;
+  return weeks.filter(w => getSeason(w.match_date || w.created_at) === currentSeason);
+}
+
+function applySeasonFilter() {
+  const filtered = filterWeeksBySeason(allHistoryData);
+  renderHistory(filtered);
+  renderRankingsFromWeeks(filtered);
 }
 
 async function loadHistory() {
+  historyPage = 5;
+  const res = await api("/history?limit=100&offset=0");
+  const weeks = res.weeks || (Array.isArray(res) ? res : []);
+  allHistoryData = weeks;
+  document.getElementById("historyList")?.classList.remove("hidden");
+  renderSeasonFilter(allHistoryData);
+  renderRankingsFromWeeks(filterWeeksBySeason(allHistoryData));
+  renderHistory(filterWeeksBySeason(allHistoryData));
+}
+
+function buildHistoryBody(w) {
+  const predsHTML = w.predictions?.length
+    ? w.predictions.map(pr => `
+        <div class="hist-pred ${pr.correct ? "correct" : ""}">
+          <span class="hist-pred-order">#${pr.order}</span>
+          <span class="hist-pred-name">${pr.player_name}</span>
+          <span class="hist-pred-result">${pr.result}</span>
+          ${pr.correct ? '<span class="hist-pred-badge">&#10003;</span>' : ''}
+        </div>`).join("")
+    : '<p class="empty-state" style="padding:6px 0;font-size:12px">Nadie apostó</p>';
+
+  const excludedHTML = w.excluded?.length
+    ? `<div class="hist-excluded">No jugaron: ${w.excluded.join(", ")}</div>` : "";
+
+  const payList = w.payments || [];
+  const paidCount = payList.filter(pay => pay.paid).length;
+  const paymentsHTML = payList.length
+    ? '<div class="history-payments">' + payList.map(pay =>
+        '<span class="history-pay-badge ' + (pay.paid ? "paid" : "unpaid") + '">' +
+        (pay.paid ? "&#10003;" : "&#10007;") + " " + pay.name + '</span>'
+      ).join("") + '</div>'
+    : "";
+
+  return `
+    <div class="hist-section-title">⚽ Apuestas · <span style="color:var(--text-muted);font-size:12px">${w.weekly_amount || 1}€/persona${excludedHTML ? " · " + w.excluded?.join(", ") + " no jugaron" : ""}</span></div>
+    <div class="hist-preds-grid">${predsHTML}</div>
+    ${payList.length ? `<div class="hist-section-title" style="margin-top:10px">💶 Pagos (${paidCount}/${payList.length})</div>${paymentsHTML}` : ""}
+  `;
+}
+
+function renderHistory(weeks) {
   const container = document.getElementById("historyList");
-  const weeks = await api("/history");
 
   if (!weeks?.length) {
     container.innerHTML = '<p class="empty-state">No hay semanas cerradas todavía.</p>';
@@ -543,20 +813,17 @@ async function loadHistory() {
   }
 
   container.innerHTML = "";
-  weeks.forEach(w => {
-    let dateStr = "";
-    if (w.created_at) {
-      try {
-        const d = new Date(w.created_at);
-        dateStr = d.toLocaleDateString("es-ES", { day: "numeric", month: "long", year: "numeric" });
-      } catch(e) { dateStr = w.created_at; }
-    }
+  const teamsMap = {};
+  teams.forEach(t => { teamsMap[t.id] = t; });
+  const visible = weeks.slice(0, historyPage);
+  const fragment = document.createDocumentFragment();
 
+  visible.forEach(w => {
     let matchDateStr = "";
     if (w.match_date) {
       try {
-        const d = new Date(w.match_date);
-        matchDateStr = " · " + d.toLocaleDateString("es-ES", { day: "numeric", month: "short" });
+        const d = new Date(w.match_date.length === 16 ? w.match_date + ":00" : w.match_date);
+        if (!isNaN(d)) matchDateStr = d.toLocaleDateString("es-ES", { day: "numeric", month: "short", year: "numeric" });
       } catch(e) {}
     }
 
@@ -564,115 +831,106 @@ async function loadHistory() {
       ? (w.round_number.toUpperCase().startsWith("JORNADA") ? w.round_number.toUpperCase() : `JORNADA ${w.round_number.toUpperCase()}`)
       : "";
     const roundStr = roundLabel ? `<span class="history-round">${roundLabel}</span>` : "";
+    const hHome = teamsMap[w.home_team_id];
+    const hAway = teamsMap[w.away_team_id];
+    const hasWinner = !!w.winners;
 
     const div = document.createElement("div");
-    div.className = "history-item";
+    div.className = "history-item history-accordion";
     div.innerHTML = `
-      <div>
-        <div class="history-match">${roundStr}${w.match}</div>
-        <div class="history-meta">
-          ${dateStr}${matchDateStr} · ${w.winners ? "🏆 " + w.winners : "Sin acertantes"}
-        </div>
-      </div>
-      <div class="history-result">${w.real_result || "—"}</div>
-      <div class="history-pot">${w.pot ? "💰 " + w.pot + "€" : ""}</div>
-    `;
-    container.appendChild(div);
-  });
-}
-
-// ===================== WEEK LOG =====================
-let weekLogVisible = false;
-
-async function toggleWeekLog() {
-  weekLogVisible = !weekLogVisible;
-  const container = document.getElementById("weekLogList");
-  const btn = document.querySelector('[onclick="toggleWeekLog()"]');
-  if (weekLogVisible) {
-    container.classList.remove("hidden");
-    if (btn) btn.textContent = "Ocultar";
-    loadWeekLog();
-  } else {
-    container.classList.add("hidden");
-    if (btn) btn.textContent = "Ver más";
-  }
-}
-
-async function loadWeekLog() {
-  const container = document.getElementById("weekLogList");
-  container.innerHTML = '<p class="empty-state">Cargando...</p>';
-  const weeks = await api("/week-log");
-
-  if (!weeks?.length) {
-    container.innerHTML = '<p class="empty-state">No hay semanas cerradas todavía.</p>';
-    return;
-  }
-
-  container.innerHTML = "";
-  weeks.forEach(w => {
-    const roundLabel = w.round_number
-      ? (w.round_number.toUpperCase().startsWith("JORNADA") ? w.round_number.toUpperCase() : `JORNADA ${w.round_number.toUpperCase()}`)
-      : "";
-
-    let matchDateStr = "";
-    if (w.match_date) {
-      try {
-        const d = new Date(w.match_date);
-        matchDateStr = d.toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" });
-      } catch(e) {}
-    }
-
-    const hasWinner = w.predictions.some(p => p.correct);
-
-    // Build predictions rows
-    const predsHTML = w.predictions.length
-      ? w.predictions.map(p => `
-          <div class="wl-pred ${p.correct ? "correct" : ""}">
-            <span class="wl-pred-order">#${p.order}</span>
-            <span class="wl-pred-name">${p.player_name}</span>
-            <span class="wl-pred-result">${p.result}</span>
-            ${p.correct ? '<span class="wl-pred-badge">✓</span>' : ''}
+      <div class="history-header">
+        ${roundStr ? '<div class="history-round-row">' + roundStr + '</div>' : ""}
+        <div class="history-teams-row">
+          <div class="history-badge-left">${hHome ? teamBadge(hHome.slug, 44) : '<div class="hist-badge-empty"></div>'}</div>
+          <div class="history-center-inline">
+            <div class="history-match-name">${w.match}</div>
+            <div class="history-result-row">
+              <span class="history-result ${hasWinner ? "winner" : "no-winner"}">${w.real_result || "—"}</span>
+              ${w.pot ? '<span class="history-pot">💰 ' + w.pot + '€</span>' : ""}
+            </div>
           </div>
-        `).join("")
-      : '<p class="empty-state" style="padding:8px 0">Nadie apostó esta semana</p>';
-
-    const excludedHTML = w.excluded?.length
-      ? `<div class="wl-excluded">No jugaron: ${w.excluded.join(", ")}</div>`
-      : "";
-
-    const div = document.createElement("div");
-    div.className = "weeklog-item";
-    div.innerHTML = `
-      <div class="wl-header" onclick="this.parentElement.classList.toggle('open')">
-        <div class="wl-header-left">
-          ${roundLabel ? `<span class="wl-round">${roundLabel}</span>` : ""}
-          <span class="wl-match">${w.match}</span>
-          ${matchDateStr ? `<span class="wl-date">${matchDateStr}</span>` : ""}
+          <div class="history-badge-right">${hAway ? teamBadge(hAway.slug, 44) : '<div class="hist-badge-empty"></div>'}</div>
         </div>
-        <div class="wl-header-right">
-          <span class="wl-real-result ${hasWinner ? "winner" : "no-winner"}">${w.real_result || "—"}</span>
-          <span class="wl-pot">${w.pot ? "💰 " + w.pot + "€" : ""}</span>
-          <span class="wl-chevron">▾</span>
+        <div class="history-meta-row">
+          <span class="history-meta">${matchDateStr ? matchDateStr + " · " : ""}${hasWinner ? "🏆 " + w.winners : "Sin acertantes"}</span>
+          <span class="history-chevron">▾</span>
         </div>
       </div>
-      <div class="wl-body">
-        <div class="wl-meta">
-          <span>💶 ${w.weekly_amount || 1}€ por persona</span>
-          ${excludedHTML}
-        </div>
-        <div class="wl-preds-grid">
-          ${predsHTML}
-        </div>
-      </div>
+      <div class="history-body"></div>
     `;
-    container.appendChild(div);
+
+    // Lazy body: only build content when accordion opens
+    div.addEventListener("click", () => {
+      const body = div.querySelector(".history-body");
+      if (!body.dataset.loaded) {
+        body.innerHTML = buildHistoryBody(w);
+        body.dataset.loaded = "1";
+      }
+      div.classList.toggle("open");
+    });
+
+    fragment.appendChild(div);
   });
+
+  container.appendChild(fragment);
+
+  const btnBar = document.createElement("div");
+  btnBar.style.cssText = "display:flex;gap:8px;margin-top:10px;";
+
+  if (weeks.length > historyPage) {
+    const btnMore = document.createElement("button");
+    btnMore.type = "button";
+    btnMore.className = "btn btn-ghost";
+    btnMore.style.cssText = "flex:1;font-size:13px;";
+    btnMore.textContent = `Ver más (${weeks.length - historyPage} restantes)`;
+    btnMore.onclick = () => { historyPage += 10; renderHistory(weeks); };
+    btnBar.appendChild(btnMore);
+  }
+
+  if (historyPage > 5) {
+    const btnLess = document.createElement("button");
+    btnLess.type = "button";
+    btnLess.className = "btn btn-ghost";
+    btnLess.style.cssText = "flex:1;font-size:13px;";
+    btnLess.textContent = "Ver menos";
+    btnLess.onclick = () => { historyPage = 5; renderHistory(weeks); container.scrollIntoView({ behavior: "smooth" }); };
+    btnBar.appendChild(btnLess);
+  }
+
+  if (btnBar.children.length) container.appendChild(btnBar);
 }
 
 // ===================== RANKINGS =====================
 async function loadRankings() {
   rankingsData = await api("/rankings");
   renderRankings();
+}
+
+function renderRankingsFromWeeks(weeks) {
+  // Recalculate rankings based on filtered weeks
+  const weekIds = new Set(weeks.map(w => w.id));
+  const filtered = rankingsData.map(player => {
+    // Filter predictions to only those in selected weeks
+    const wins = weeks.filter(w =>
+      w.predictions?.some(pr => pr.player_name === player.name && pr.correct)
+    ).length;
+    const moneyWon = weeks
+      .filter(w => w.predictions?.some(pr => pr.player_name === player.name && pr.correct))
+      .reduce((sum, w) => sum + (parseInt(w.pot) || 0), 0);
+    const totalPredictions = weeks.filter(w =>
+      w.predictions?.some(pr => pr.player_name === player.name)
+    ).length;
+    return { ...player, wins, money_won: moneyWon, total_predictions: totalPredictions };
+  });
+  filtered.sort((a, b) => b.wins - a.wins || (b.money_won || 0) - (a.money_won || 0));
+  renderRankings(filtered);
+}
+
+function toggleActiveOnly() {
+  showActiveOnly = !showActiveOnly;
+  const btn = document.getElementById("activeOnlySwitch");
+  if (btn) btn.classList.toggle("active", showActiveOnly);
+  applySeasonFilter();
 }
 
 function switchTab(tab, e) {
@@ -682,21 +940,23 @@ function switchTab(tab, e) {
   renderRankings();
 }
 
-function renderRankings() {
+function renderRankings(data) {
   const container = document.getElementById("rankingsList");
+  let displayData = data || rankingsData;
+  if (showActiveOnly) displayData = displayData.filter(p => p.active != 0);
 
-  if (!rankingsData.length) {
+  if (!displayData.length) {
     container.innerHTML = '<p class="empty-state">Aún no hay datos de ranking.</p>';
     return;
   }
 
   let sorted;
   if (currentTab === "wins") {
-    sorted = [...rankingsData].sort((a, b) => b.wins - a.wins);
+    sorted = [...displayData].sort((a, b) => b.wins - a.wins);
   } else if (currentTab === "money") {
-    sorted = [...rankingsData].sort((a, b) => (b.money_won || 0) - (a.money_won || 0));
+    sorted = [...displayData].sort((a, b) => (b.money_won || 0) - (a.money_won || 0));
   } else {
-    sorted = [...rankingsData].sort((a, b) => {
+    sorted = [...displayData].sort((a, b) => {
       const rA = a.total_predictions > 0 ? a.wins / a.total_predictions : 0;
       const rB = b.total_predictions > 0 ? b.wins / b.total_predictions : 0;
       return rB - rA;
@@ -709,11 +969,12 @@ function renderRankings() {
   sorted.forEach((p, i) => {
     const rate = p.total_predictions > 0 ? ((p.wins / p.total_predictions) * 100).toFixed(0) : 0;
     const displayValue = currentTab === "wins" ? p.wins : currentTab === "money" ? (p.money_won || 0) + "€" : rate + "%";
+    const spent = p.money_spent || 0;
     const subText = currentTab === "wins"
-      ? `${p.money_won || 0}€ ganados · ${rate}% acierto · ${p.total_predictions} apuestas`
+      ? `${p.money_won || 0}€ ganados · ${rate}% acierto · ${p.total_predictions} apuestas · ${spent}€ invertidos`
       : currentTab === "money"
-      ? `${p.wins} victorias · ${rate}% acierto`
-      : `${p.wins} victorias · ${p.total_predictions} apuestas`;
+      ? `${p.wins} victorias · ${rate}% acierto · ${spent}€ invertidos`
+      : `${p.wins} victorias · ${p.total_predictions} apuestas · ${spent}€ invertidos`;
 
     const div = document.createElement("div");
     div.className = "ranking-item" + (p.active == 0 ? " inactive-player" : "");
@@ -728,6 +989,53 @@ function renderRankings() {
     `;
     container.appendChild(div);
   });
+}
+
+
+// ===================== SHARE / CAPTURE =====================
+async function captureAndShare() {
+  const btn = document.querySelector(".btn-share");
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Generando..."; }
+
+  // Show firma
+  const firma = document.getElementById("scoreboardFirma");
+  if (firma) firma.classList.add("visible");
+
+  // Elements to capture
+  const scoreboard = document.getElementById("scoreboard");
+  const playersCard = document.getElementById("playersList").closest(".card");
+
+  // Create wrapper
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText = "background:#0a0e1a;padding:20px;display:flex;flex-direction:column;gap:20px;width:" + scoreboard.offsetWidth + "px;position:fixed;left:-9999px;top:0;";
+  wrapper.appendChild(scoreboard.cloneNode(true));
+  wrapper.appendChild(playersCard.cloneNode(true));
+  document.body.appendChild(wrapper);
+
+  try {
+    const canvas = await html2canvas(wrapper, {
+      backgroundColor: "#0a0e1a",
+      scale: 2,
+      useCORS: true,
+      allowTaint: true,
+      logging: false
+    });
+
+    // Download
+    const link = document.createElement("a");
+    link.download = "porra_" + (currentWeek?.match || "semana").replace(/[^a-z0-9]/gi, "_").toLowerCase() + ".png";
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+
+    toast("✓ Imagen descargada", "success");
+  } catch(err) {
+    toast("Error al generar imagen", "error");
+    console.error(err);
+  } finally {
+    document.body.removeChild(wrapper);
+    if (firma) firma.classList.remove("visible");
+    if (btn) { btn.disabled = false; btn.textContent = "📸 Compartir apuestas"; }
+  }
 }
 
 // ===================== ADMIN DRAWER =====================
@@ -752,6 +1060,9 @@ function toggleAdmin() {
     }
     renderExcludeLists();
     renderManagePlayers();
+    renderManageTeams();
+    renderTeamSelectors("newHomeTeam", "newAwayTeam");
+    renderTeamSelectors("editHomeTeam", "editAwayTeam", currentWeek?.home_team_id, currentWeek?.away_team_id);
     drawer.classList.add("open");
     overlay.classList.remove("hidden");
     document.body.style.overflow = "hidden";
