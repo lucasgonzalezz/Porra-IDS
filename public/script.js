@@ -14,6 +14,11 @@ let showActiveOnly = true;
 let editExcludedPlayers = [];
 let teams = [];
 
+// =====================================================
+// 🔥 FIREBASE: Info del usuario actual
+// =====================================================
+let currentUser = null; // {playerId, playerName, role, email}
+
 // ===================== INIT =====================
 let isRedirecting = false;
 
@@ -27,6 +32,29 @@ let isRedirecting = false;
       }
       return;
     }
+    
+    // =====================================================
+    // 🔥 FIREBASE: Guardar info del usuario
+    // =====================================================
+    currentUser = {
+      playerId: me.playerId,
+      playerName: me.playerName,
+      role: me.role,
+      email: me.email
+    };
+    
+    // Mostrar mensaje de bienvenida en consola
+    if (currentUser.playerName) {
+      console.log(`👋 Bienvenid@ ${currentUser.playerName} (${currentUser.role})`);
+    }
+    
+    // 🔥 FIREBASE: Ocultar botón Admin si no es admin
+    if (currentUser.role !== 'admin') {
+      const adminBtn = document.querySelector('.btn-admin-toggle');
+      if (adminBtn) adminBtn.style.display = 'none';
+    }
+    // =====================================================
+    
     loadData();
   } catch(e) {
     console.error("Error checking auth:", e);
@@ -40,6 +68,7 @@ async function loadData() {
   await loadWeek();
   await loadPredictions();
   await loadPayments();
+  await loadPoll();  // 🗳️ Cargar votación activa
   reorderList = []; // reset so renderReorder picks up fresh DB order
   calculateTurn();
   renderPlayers();
@@ -49,6 +78,15 @@ async function loadData() {
   await loadRankings();
   await loadHistory();
   document.getElementById("playersCount").textContent = players.filter(p => p.active).length;
+  
+  // =====================================================
+  // 🔥 FIREBASE: Renderizar gestión de usuarios si es admin
+  // =====================================================
+  if (currentUser && currentUser.role === 'admin') {
+    renderUserManagement();
+    renderAdminPoll();  // 🗳️ Render admin poll view
+  }
+  // =====================================================
 }
 
 // ===================== FETCH =====================
@@ -1004,15 +1042,12 @@ async function captureAndShare() {
   const btn = document.querySelector(".btn-share");
   if (btn) { btn.disabled = true; btn.textContent = "⏳ Generando..."; }
 
-  // Show firma
   const firma = document.getElementById("scoreboardFirma");
   if (firma) firma.classList.add("visible");
 
-  // Elements to capture
   const scoreboard = document.getElementById("scoreboard");
   const playersCard = document.getElementById("playersList").closest(".card");
 
-  // Create wrapper
   const wrapper = document.createElement("div");
   wrapper.style.cssText = "background:#0a0e1a;padding:20px;display:flex;flex-direction:column;gap:20px;width:" + scoreboard.offsetWidth + "px;position:fixed;left:-9999px;top:0;";
   wrapper.appendChild(scoreboard.cloneNode(true));
@@ -1020,15 +1055,37 @@ async function captureAndShare() {
   document.body.appendChild(wrapper);
 
   try {
+    //   Convertir SVGs a PNG para móviles
+    const svgElements = wrapper.querySelectorAll('img[src$=".svg"]');
+    const conversionPromises = [];
+    
+    svgElements.forEach(img => {
+      const promise = new Promise((resolve) => {
+        if (img.complete && img.naturalWidth > 0) {
+          convertSvgToDataUrl(img).then(() => resolve());
+        } else {
+          img.onload = () => {
+            convertSvgToDataUrl(img).then(() => resolve());
+          };
+          img.onerror = () => resolve();
+        }
+      });
+      conversionPromises.push(promise);
+    });
+    
+    await Promise.all(conversionPromises);
+    await new Promise(resolve => setTimeout(resolve, 300));
+
     const canvas = await html2canvas(wrapper, {
       backgroundColor: "#0a0e1a",
       scale: 2,
       useCORS: true,
       allowTaint: true,
-      logging: false
+      logging: false,
+      imageTimeout: 0,
+      removeContainer: false
     });
 
-    // Download
     const link = document.createElement("a");
     link.download = "porra_" + (currentWeek?.match || "semana").replace(/[^a-z0-9]/gi, "_").toLowerCase() + ".png";
     link.href = canvas.toDataURL("image/png");
@@ -1045,6 +1102,76 @@ async function captureAndShare() {
   }
 }
 
+async function convertSvgToDataUrl(imgElement) {
+  return new Promise((resolve) => {
+    try {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      
+      img.crossOrigin = 'anonymous';
+      
+      img.onload = () => {
+        canvas.width = imgElement.width || imgElement.offsetWidth || 50;
+        canvas.height = imgElement.height || imgElement.offsetHeight || 50;
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        
+        try {
+          const dataUrl = canvas.toDataURL('image/png');
+          imgElement.src = dataUrl;
+          resolve();
+        } catch (e) {
+          console.warn('Error converting SVG:', e);
+          resolve();
+        }
+      };
+      
+      img.onerror = () => {
+        console.warn('Error loading SVG');
+        resolve();
+      };
+      
+      img.src = imgElement.src;
+    } catch (e) {
+      console.warn('Error in convertSvgToDataUrl:', e);
+      resolve();
+    }
+  });
+}
+
+// ===================== ADMIN DRAWER =====================
+function toggleAdmin() {
+  if (currentUser && currentUser.role !== 'admin') {
+    return toast("No tienes permisos de administrador", "error");
+  }
+  
+  const drawer = document.getElementById("adminDrawer");
+  const overlay = document.getElementById("drawerOverlay");
+  const isOpen = drawer.classList.contains("open");
+
+  if (isOpen) {
+    drawer.classList.remove("open");
+    overlay.classList.add("hidden");
+    document.body.style.overflow = "";
+  } else {
+    if (currentWeek) {
+      document.getElementById("editMatch").value = currentWeek.match || "";
+      document.getElementById("editRound").value = currentWeek.round_number || "";
+      if (currentWeek.match_date) {
+        document.getElementById("editMatchDate").value = currentWeek.match_date.slice(0, 16);
+      }
+      editExcludedPlayers = getExcludedForCurrentWeek();
+    }
+    renderExcludeLists();
+    renderManagePlayers();
+    renderManageTeams();
+    renderTeamSelectors("newHomeTeam", "newAwayTeam");
+    renderTeamSelectors("editHomeTeam", "editAwayTeam", currentWeek?.home_team_id, currentWeek?.away_team_id);
+    drawer.classList.add("open");
+    overlay.classList.remove("hidden");
+    document.body.style.overflow = "hidden";
+  }
+}
 // ===================== ADMIN DRAWER =====================
 function toggleAdmin() {
   const drawer = document.getElementById("adminDrawer");
@@ -1206,3 +1333,366 @@ document.addEventListener("DOMContentLoaded", () => {
     else closeModal();
   });
 });
+
+// =====================================================
+//  FIREBASE: GESTIÓN DE USUARIOS (SOLO ADMIN)
+// =====================================================
+
+function renderUserManagement() {
+  // Llenar select de jugadores
+  const select = document.getElementById("userPlayerSelect");
+  if (!select) return;
+  
+  select.innerHTML = '<option value="">Selecciona un jugador...</option>';
+  players.forEach(p => {
+    const option = document.createElement("option");
+    option.value = p.id;
+    option.textContent = `${p.name}${p.email ? ' (' + p.email + ')' : ''}`;
+    select.appendChild(option);
+  });
+  
+  // Renderizar lista de usuarios
+  renderUserList();
+}
+
+async function associateEmail() {
+  const playerId = document.getElementById("userPlayerSelect").value;
+  const email = document.getElementById("userEmail").value.trim().toLowerCase();
+  
+  if (!playerId || !email) {
+    return toast("Selecciona un jugador e introduce un email", "error");
+  }
+  
+  if (!email.includes("@")) {
+    return toast("Email inválido", "error");
+  }
+  
+  try {
+    const data = await post("/api/associate-email", { player_id: parseInt(playerId), email });
+    if (data.error) {
+      return toast(data.error, "error");
+    }
+    toast("✓ Email asociado correctamente", "success");
+    document.getElementById("userEmail").value = "";
+    document.getElementById("userPlayerSelect").value = "";
+    await loadPlayers();
+    renderManagePlayers();
+    renderUserManagement();
+  } catch (err) {
+    toast(err.message || "Error al asociar email", "error");
+  }
+}
+
+async function changeUserRole(playerId, newRole) {
+  const player = players.find(p => p.id === playerId);
+  if (!player) return;
+  
+  const confirmMsg = newRole === 'admin' 
+    ? `¿Hacer a ${player.name} administrador? Tendrá acceso total al panel de administración.`
+    : `¿Quitar permisos de administrador a ${player.name}? Solo podrá hacer sus propias apuestas.`;
+  
+  showModal({
+    icon: "👤",
+    title: "Cambiar rol de usuario",
+    body: confirmMsg,
+    confirmText: "Sí, cambiar rol",
+    danger: newRole === 'player',
+    onConfirm: async () => {
+      try {
+        const data = await post("/api/change-role", { player_id: playerId, role: newRole });
+        if (data.error) {
+          return toast(data.error, "error");
+        }
+        toast(`✓ Rol de ${player.name} actualizado a ${newRole === 'admin' ? 'Administrador' : 'Jugador'}`, "success");
+        await loadPlayers();
+        renderUserManagement();
+      } catch (err) {
+        toast("Error al cambiar rol", "error");
+      }
+    }
+  });
+}
+
+function renderUserList() {
+  const container = document.getElementById("usersList");
+  if (!container) return;
+  
+  container.innerHTML = "";
+  
+  // Ordenar: primero admins, luego jugadores con email, luego sin email
+  const sorted = [...players].sort((a, b) => {
+    if (a.role === 'admin' && b.role !== 'admin') return -1;
+    if (a.role !== 'admin' && b.role === 'admin') return 1;
+    if (a.email && !b.email) return -1;
+    if (!a.email && b.email) return 1;
+    return 0;
+  });
+  
+  sorted.forEach(p => {
+    const div = document.createElement("div");
+    div.className = "user-item";
+    div.innerHTML = `
+      <div class="user-info">
+        <div class="user-name">${p.name}</div>
+        <div class="user-email">${p.email || '<span style="color:#6b7a99">Sin email asociado</span>'}</div>
+      </div>
+      <div class="user-actions">
+        <span class="user-role-badge ${p.role === 'admin' ? 'admin' : ''}">${p.role === 'admin' ? 'ADMIN' : 'Jugador'}</span>
+        ${p.role === 'admin' 
+          ? `<button class="btn-mini btn-red" onclick="changeUserRole(${p.id}, 'player')">Quitar Admin</button>`
+          : `<button class="btn-mini btn-green" onclick="changeUserRole(${p.id}, 'admin')">Hacer Admin</button>`
+        }
+      </div>
+    `;
+    container.appendChild(div);
+  });
+  
+  if (sorted.length === 0) {
+    container.innerHTML = '<div style="padding:20px;text-align:center;color:#6b7a99;font-size:13px">No hay jugadores</div>';
+  }
+}
+// =====================================================
+// 🗳️ SISTEMA DE VOTACIÓN DE PARTIDOS
+// =====================================================
+
+let currentPoll = null;
+let pollOptions = [];
+
+async function loadPoll() {
+  try {
+    const data = await api("/api/active-poll");
+    currentPoll = data.active ? data : null;
+    
+    if (currentPoll && currentPoll.active) {
+      pollOptions = data.options || [];
+      renderPublicPoll(data);
+    } else {
+      document.getElementById("pollCard").style.display = "none";
+    }
+  } catch(e) {
+    console.error("Error loading poll:", e);
+  }
+}
+
+function renderPublicPoll(data) {
+  const card = document.getElementById("pollCard");
+  const title = document.getElementById("pollCardTitle");
+  const body = document.getElementById("pollCardBody");
+  
+  if (!data || !data.active) {
+    card.style.display = "none";
+    return;
+  }
+  
+  card.style.display = "block";
+  title.textContent = data.poll.title;
+  
+  const myVote = data.votes.find(v => v.player_id === currentUser.playerId);
+  const hasVoted = !!myVote;
+  
+  let html = '<div class="poll-options-grid">';
+  
+  data.options.forEach(opt => {
+    const isMyVote = myVote && myVote.option_id === opt.id;
+    const percentage = data.votes.length > 0 ? Math.round((opt.votes / data.votes.length) * 100) : 0;
+    
+    html += `
+      <div class="poll-option ${isMyVote ? 'voted' : ''}" onclick="votePoll(${opt.id})">
+        <div class="poll-option-teams">
+          ${teamBadge(opt.home_team_slug, 32)}
+          <span class="poll-vs">vs</span>
+          ${teamBadge(opt.away_team_slug, 32)}
+        </div>
+        <div class="poll-option-names">
+          ${opt.home_team_name} - ${opt.away_team_name}
+        </div>
+        ${hasVoted ? `
+          <div class="poll-option-bar">
+            <div class="poll-option-bar-fill" style="width:${percentage}%"></div>
+          </div>
+          <div class="poll-option-votes">${opt.votes} ${opt.votes === 1 ? 'voto' : 'votos'} (${percentage}%)</div>
+        ` : ''}
+        ${isMyVote ? '<div class="poll-option-check">✓ Tu voto</div>' : ''}
+      </div>
+    `;
+  });
+  
+  html += '</div>';
+  
+  if (!hasVoted) {
+    html += '<p class="poll-note">👆 Click en un partido para votar</p>';
+  } else {
+    html += '<p class="poll-note">✓ Ya has votado. Puedes cambiar tu voto haciendo click en otro partido.</p>';
+  }
+  
+  body.innerHTML = html;
+}
+
+async function votePoll(optionId) {
+  if (!currentPoll || !currentPoll.active) {
+    return toast("Esta votación ya no está activa", "error");
+  }
+  
+  try {
+    const data = await post("/api/vote-poll", {
+      poll_id: currentPoll.poll.id,
+      option_id: optionId
+    });
+    
+    if (data.error) {
+      return toast(data.error, "error");
+    }
+    
+    toast("✓ Voto registrado", "success");
+    await loadPoll();
+    
+  } catch(err) {
+    toast("Error al votar", "error");
+  }
+}
+
+// =====================================================
+// 🗳️ ADMIN: Crear y gestionar votaciones
+// =====================================================
+
+let pollOptionCounter = 0;
+
+function addPollOption() {
+  pollOptionCounter++;
+  const container = document.getElementById("pollOptionsContainer");
+  
+  const div = document.createElement("div");
+  div.className = "poll-option-row";
+  div.id = `pollOption${pollOptionCounter}`;
+  div.innerHTML = `
+    <div class="team-selector-row">
+      <select class="team-select poll-home-select" data-option="${pollOptionCounter}">
+        <option value="">— Local —</option>
+        ${teams.filter(t => t.active).map(t => `<option value="${t.id}">${t.name}</option>`).join('')}
+      </select>
+      <span class="score-sep">vs</span>
+      <select class="team-select poll-away-select" data-option="${pollOptionCounter}">
+        <option value="">— Visitante —</option>
+        ${teams.filter(t => t.active).map(t => `<option value="${t.id}">${t.name}</option>`).join('')}
+      </select>
+    </div>
+    <button type="button" class="btn-mini btn-red" onclick="removePollOption(${pollOptionCounter})" style="margin-top:4px">✕ Quitar</button>
+  `;
+  
+  container.appendChild(div);
+}
+
+function removePollOption(id) {
+  const elem = document.getElementById(`pollOption${id}`);
+  if (elem) elem.remove();
+}
+
+async function createPoll() {
+  const title = document.getElementById("pollTitle").value.trim() || "Vota el próximo partido";
+  
+  // Recoger opciones
+  const options = [];
+  const container = document.getElementById("pollOptionsContainer");
+  const rows = container.querySelectorAll(".poll-option-row");
+  
+  rows.forEach(row => {
+    const homeSelect = row.querySelector(".poll-home-select");
+    const awaySelect = row.querySelector(".poll-away-select");
+    const homeId = parseInt(homeSelect.value);
+    const awayId = parseInt(awaySelect.value);
+    
+    if (homeId && awayId) {
+      options.push({ home_team_id: homeId, away_team_id: awayId });
+    }
+  });
+  
+  if (options.length === 0) {
+    return toast("Añade al menos un partido para votar", "error");
+  }
+  
+  showModal({
+    icon: "🗳️",
+    title: "¿Crear votación?",
+    body: `Se creará una votación con <strong>${options.length} ${options.length === 1 ? 'partido' : 'partidos'}</strong>.<br><br>La votación anterior (si existe) se cerrará automáticamente.`,
+    confirmText: "Crear Votación",
+    danger: false,
+    onConfirm: async () => {
+      try {
+        const data = await post("/api/create-poll", { title, options });
+        if (data.error) {
+          return toast(data.error, "error");
+        }
+        toast("✓ Votación creada", "success");
+        document.getElementById("pollTitle").value = "Vota el próximo partido";
+        document.getElementById("pollOptionsContainer").innerHTML = "";
+        pollOptionCounter = 0;
+        await loadPoll();
+        if (currentUser.role === 'admin') renderAdminPoll();
+      } catch(err) {
+        toast("Error al crear votación", "error");
+      }
+    }
+  });
+}
+
+async function closePoll() {
+  showModal({
+    icon: "🔒",
+    title: "¿Cerrar votación?",
+    body: "La votación actual se cerrará y los jugadores no podrán votar más.",
+    confirmText: "Cerrar Votación",
+    danger: true,
+    onConfirm: async () => {
+      try {
+        await post("/api/close-poll", {});
+        toast("✓ Votación cerrada", "info");
+        await loadPoll();
+        if (currentUser.role === 'admin') renderAdminPoll();
+      } catch(err) {
+        toast("Error al cerrar votación", "error");
+      }
+    }
+  });
+}
+
+function renderAdminPoll() {
+  const container = document.getElementById("currentPollAdmin");
+  const btn = document.getElementById("closePollBtn");
+  
+  if (!currentPoll || !currentPoll.active) {
+    container.innerHTML = '<p class="empty-state" style="padding:12px 0;font-size:13px">No hay votación activa</p>';
+    btn.style.display = "none";
+    return;
+  }
+  
+  btn.style.display = "block";
+  
+  const totalVotes = currentPoll.votes.length;
+  const activePlayers = players.filter(p => p.active).length;
+  
+  let html = `
+    <div style="margin-bottom:10px">
+      <strong>${currentPoll.poll.title}</strong><br>
+      <span style="font-size:12px;color:var(--text-muted)">${totalVotes} de ${activePlayers} jugadores han votado</span>
+    </div>
+  `;
+  
+  pollOptions.forEach(opt => {
+    const percentage = totalVotes > 0 ? Math.round((opt.votes / totalVotes) * 100) : 0;
+    html += `
+      <div style="margin-bottom:8px;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          ${teamBadge(opt.home_team_slug, 20)}
+          <span style="font-size:12px">${opt.home_team_name} vs ${opt.away_team_name}</span>
+          ${teamBadge(opt.away_team_slug, 20)}
+        </div>
+        <div style="background:rgba(255,255,255,0.05);height:6px;border-radius:3px;overflow:hidden">
+          <div style="background:var(--green);height:100%;width:${percentage}%"></div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:2px">${opt.votes} votos (${percentage}%)</div>
+      </div>
+    `;
+  });
+  
+  container.innerHTML = html;
+}
