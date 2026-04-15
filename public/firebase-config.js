@@ -10,13 +10,12 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyAkP1v31LPhFxJQnaD74fg3G6y3juQnppQ",
-  authDomain: "loginwebapuestas.firebaseapp.com",
-  projectId: "loginwebapuestas",
-  storageBucket: "loginwebapuestas.firebasestorage.app",
-  messagingSenderId: "210478444611",
-  appId: "1:210478444611:web:b10cea26d4bbafed8224f6",
-  measurementId: "G-W6756DJ6M6"
+  apiKey: "AIzaSyCLpmt-HnYsLemRxPcmYtLHZrVdd1OjZg4",
+  authDomain: "web-apuestas.firebaseapp.com",
+  projectId: "web-apuestas",
+  storageBucket: "web-apuestas.firebasestorage.app",
+  messagingSenderId: "776414560504",
+  appId: "1:776414560504:web:14cf1a7f06c8716c933b0d"
 };
 
 // Initialize Firebase
