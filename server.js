@@ -441,7 +441,6 @@ app.post("/api/change-role", async (req, res) => {
 
 // =====================================================
 // FIN DE ENDPOINTS DE FIREBASE
-// A partir de aquí, todo el código es IGUAL que antes
 // =====================================================
 
 // ===================== PLAYERS =====================
@@ -586,7 +585,16 @@ app.post("/predict", async (req, res) => {
     const playerIdsWhoBet = new Set(preds.map(p => p.player_id));
     const nextPlayer = players.find(p => !playerIdsWhoBet.has(p.id));
     if (!nextPlayer) return res.status(400).json({ error: "Todos ya han apostado" });
-    if (parseInt(player_id) !== nextPlayer.id) return res.status(400).json({ error: "No es tu turno" });
+    
+    // 🔥 Permitir apuesta si:
+    // 1. Es el turno del jugador (cualquiera puede apostar en su turno)
+    // 2. Es Admin (Admin puede apostar por cualquiera)
+    const isAdmin = req.session.user && req.session.user.role === 'admin';
+    const isPlayerTurn = parseInt(player_id) === nextPlayer.id;
+    
+    if (!isPlayerTurn && !isAdmin) {
+      return res.status(400).json({ error: "No es tu turno" });
+    }
     
     // Insertar predicción
     await pool.query("INSERT INTO predictions (week_id, player_id, result) VALUES ($1, $2, $3)", [week_id, player_id, result.trim()]);
@@ -623,6 +631,82 @@ app.post("/predict", async (req, res) => {
     res.json({ success: true });
   } catch {
     res.status(400).json({ error: "Resultado ya elegido o jugador ya apostó" });
+  }
+});
+
+// =====================================================
+//  SALTAR JUGADOR (SOLO ADMIN)
+// =====================================================
+app.post("/skip-player", async (req, res) => {
+  // Verificar que es admin
+  if (!req.session.user || req.session.user.role !== 'admin') {
+    return res.status(403).json({ error: "Solo administradores pueden hacer esto" });
+  }
+
+  const { week_id, player_id } = req.body;
+  if (!week_id || !player_id) {
+    return res.status(400).json({ error: "Datos incompletos" });
+  }
+
+  try {
+    const { rows: weekRows } = await pool.query("SELECT * FROM weeks WHERE id = $1", [week_id]);
+    if (!weekRows.length) return res.status(404).json({ error: "Semana no encontrada" });
+    const week = weekRows[0];
+
+    // Obtener lista de excluidos actuales
+    const excludedIds = week.excluded_players ? week.excluded_players.split(",").filter(Boolean).map(Number) : [];
+
+    // Agregar este jugador a la lista de excluidos
+    if (!excludedIds.includes(parseInt(player_id))) {
+      excludedIds.push(parseInt(player_id));
+    }
+
+    // Actualizar en la BD
+    await pool.query(
+      "UPDATE weeks SET excluded_players = $1 WHERE id = $2",
+      [excludedIds.join(","), week_id]
+    );
+
+    // Obtener el siguiente jugador para enviarle email
+    const { rows: players } = await pool.query(
+      "SELECT * FROM players WHERE active = 1 AND id != ALL($1) ORDER BY order_position ASC",
+      [excludedIds.length ? excludedIds : [0]]
+    );
+    
+    const { rows: preds } = await pool.query(
+      "SELECT * FROM predictions WHERE week_id = $1 ORDER BY id ASC",
+      [week_id]
+    );
+    const playerIdsWhoBet = new Set(preds.map(p => p.player_id));
+    const nextPlayer = players.find(p => !playerIdsWhoBet.has(p.id));
+
+    // Enviar email al siguiente jugador (si existe)
+    if (nextPlayer) {
+      const homeTeamName = week.home_team_id 
+        ? (await pool.query("SELECT name FROM teams WHERE id = $1", [week.home_team_id])).rows[0]?.name || "Local"
+        : "Local";
+      const awayTeamName = week.away_team_id
+        ? (await pool.query("SELECT name FROM teams WHERE id = $1", [week.away_team_id])).rows[0]?.name || "Visitante"
+        : "Visitante";
+
+      const matchInfo = week.match || `${homeTeamName} vs ${awayTeamName}`;
+
+      sendTurnToPlayer(pool, nextPlayer.id, matchInfo, homeTeamName, awayTeamName)
+        .then(success => {
+          if (success) {
+            console.log(`📧 Email de turno enviado a ${nextPlayer.name}`);
+          }
+        })
+        .catch(err => {
+          console.error("❌ Error enviando email de turno:", err.message);
+        });
+    }
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("❌ Error saltando jugador:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -663,11 +747,19 @@ app.post("/close-week", async (req, res) => {
       [real_result.trim(), amountPerPerson, newPot, nextPot, week_id]
     );
 
+    // Obtener TODOS los jugadores activos en su orden original
     const { rows: allActivePlayers } = await client.query(
-      "SELECT * FROM players WHERE active = 1 AND id != ALL($1) ORDER BY order_position ASC",
-      [excludedIds.length ? excludedIds : [0]]
+      "SELECT * FROM players WHERE active = 1 ORDER BY order_position ASC"
     );
-    const newOrder = [...allActivePlayers.slice(1), allActivePlayers[0]];
+    
+    // Rotar TODOS los jugadores (incluyendo los que fueron saltados esta semana)
+    // El primero va al final, los demás avanzan un puesto
+    const newOrder = [
+      ...allActivePlayers.slice(1),
+      allActivePlayers[0]
+    ];
+    
+    // Actualizar posiciones
     for (let i = 0; i < newOrder.length; i++) {
       await client.query("UPDATE players SET order_position = $1 WHERE id = $2", [i + 1, newOrder[i].id]);
     }
@@ -861,11 +953,17 @@ app.get("/api/export", async (req, res) => {
 });
 
 app.post("/api/import", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'admin') {
+    return res.status(403).json({ error: "Solo administradores pueden hacer esto" });
+  }
   const { players, weeks, predictions, teams, payments } = req.body;
   if (!players || !weeks || !predictions) return res.status(400).json({ error: "JSON inválido: faltan datos" });
   try {
     await pool.query("DELETE FROM predictions");
     await pool.query("DELETE FROM payments").catch(() => {});
+    await pool.query("DELETE FROM poll_votes").catch(() => {});
+    await pool.query("DELETE FROM poll_options").catch(() => {});
+    await pool.query("DELETE FROM match_polls").catch(() => {});
     await pool.query("DELETE FROM weeks");
     await pool.query("DELETE FROM players");
     await pool.query("DELETE FROM teams");
@@ -922,9 +1020,15 @@ app.post("/api/import", async (req, res) => {
 });
 
 app.post("/api/reset", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'admin') {
+    return res.status(403).json({ error: "Solo administradores pueden hacer esto" });
+  }
   try {
     await pool.query("DELETE FROM predictions");
     await pool.query("DELETE FROM payments").catch(() => {});
+    await pool.query("DELETE FROM poll_votes").catch(() => {});
+    await pool.query("DELETE FROM poll_options").catch(() => {});
+    await pool.query("DELETE FROM match_polls").catch(() => {});
     await pool.query("DELETE FROM weeks");
     await pool.query("DELETE FROM players");
     await pool.query("DELETE FROM teams");
@@ -1126,6 +1230,50 @@ app.post("/api/close-poll", async (req, res) => {
     await pool.query("UPDATE match_polls SET active = false WHERE active = true");
     res.json({ success: true });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =====================================================
+// 🗳️ CERRAR VOTACIÓN Y CREAR SEMANA CON GANADOR
+// =====================================================
+app.post("/api/create-week-from-poll", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'admin') {
+    return res.status(403).json({ error: "Solo administradores pueden hacer esto" });
+  }
+
+  const { home_team_id, away_team_id, round_number, match_name, match_date } = req.body;
+  
+  console.log("📝 Creando semana desde votación:", { home_team_id, away_team_id, round_number, match_name, match_date });
+
+  if (!home_team_id || !away_team_id || !round_number) {
+    console.error("❌ Datos incompletos");
+    return res.status(400).json({ error: "Datos incompletos" });
+  }
+
+  try {
+    // Cerrar votación
+    const closeResult = await pool.query("UPDATE match_polls SET active = false WHERE active = true");
+    console.log("✅ Votación cerrada");
+    
+    // Convertir match_date a formato correcto si existe
+    let formattedDate = null;
+    if (match_date) {
+      // match_date viene como "2026-04-25T14:30" y PostgreSQL espera "2026-04-25 14:30:00"
+      formattedDate = match_date.replace('T', ' ') + ':00';
+      console.log("📅 Fecha formateada:", formattedDate);
+    }
+    
+    // Crear nueva semana directamente con los datos
+    const { rows: newWeek } = await pool.query(
+      "INSERT INTO weeks (home_team_id, away_team_id, round_number, match, match_date, finished) VALUES ($1, $2, $3, $4, $5, 0) RETURNING *",
+      [home_team_id, away_team_id, round_number, match_name || null, formattedDate || null]
+    );
+
+    console.log("✅ Semana creada:", newWeek[0]);
+    res.json({ success: true, message: "Semana creada desde votación", week: newWeek[0] });
+  } catch (err) {
+    console.error("❌ Error al crear semana:", err);
     res.status(500).json({ error: err.message });
   }
 });
