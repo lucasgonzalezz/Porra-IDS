@@ -58,6 +58,7 @@ let isRedirecting = false;
     loadData();
   } catch(e) {
     console.error("Error checking auth:", e);
+
     // Don't redirect on network error, just show empty state
   }
 })();
@@ -87,6 +88,9 @@ async function loadData() {
     renderAdminPoll();  // 🗳️ Render admin poll view
   }
   // =====================================================
+  
+  // Mostrar/ocultar botón de saltar
+  updateSkipPlayerButton();
 }
 
 // ===================== FETCH =====================
@@ -352,7 +356,9 @@ function getExcludedForCurrentWeek() {
 
 function getActivePlayers() {
   const excluded = getExcludedForCurrentWeek();
-  return players.filter(p => p.active && !excluded.includes(p.id));
+  return players
+    .filter(p => p.active && !excluded.includes(p.id))
+    .sort((a, b) => a.order_position - b.order_position);
 }
 
 // ===================== TURN =====================
@@ -422,6 +428,14 @@ function renderPlayers() {
 function togglePayment(playerId, currentPaid) {
   const player = players.find(p => p.id === playerId);
   if (!player) return;
+
+  // 🔒 VALIDACIÓN: Solo el jugador o el admin pueden marcar pagos
+  const isAdmin = currentUser && currentUser.role === 'admin';
+  const isSelf = currentUser && currentUser.playerId === playerId;
+
+  if (!isAdmin && !isSelf) {
+    return toast("Solo puedes marcar tus propios pagos", "error");
+  }
 
   if (!currentPaid) {
     // Confirmar pago
@@ -651,6 +665,47 @@ function sendPrediction() {
       }
     }
   });
+}
+
+// =====================================================
+// ⏭️ SALTAR JUGADOR (SOLO ADMIN)
+// =====================================================
+function skipPlayer() {
+  if (!currentWeek) return toast("No hay semana activa", "error");
+  if (!currentTurnPlayer) return toast("No hay turno activo", "error");
+
+  // Verificar que es Admin
+  if (!currentUser || currentUser.role !== 'admin') {
+    return toast("Solo el admin puede saltar jugadores", "error");
+  }
+
+  showModal({
+    icon: "⏭️",
+    title: "¿Saltar jugador?",
+    body: `¿Estás seguro que quieres saltar a <strong>${currentTurnPlayer.name}</strong>? No jugará esta semana.`,
+    confirmText: "Sí, saltar",
+    danger: true,
+    onConfirm: async () => {
+      const data = await post("/skip-player", {
+        week_id: currentWeek.id,
+        player_id: currentTurnPlayer.id
+      });
+      if (data.error) {
+        toast(data.error, "error");
+      } else {
+        toast(`✓ ${currentTurnPlayer.name} saltado`, "success");
+        loadData();
+      }
+    }
+  });
+}
+
+// Mostrar/ocultar botón de saltar según si es Admin
+function updateSkipPlayerButton() {
+  const skipBtn = document.getElementById("skipPlayerBtn");
+  if (skipBtn) {
+    skipBtn.style.display = (currentUser && currentUser.role === 'admin' && currentWeek && !currentWeek.finished) ? "block" : "none";
+  }
 }
 
 async function addPlayer() {
@@ -1222,8 +1277,14 @@ function closeModal() {
   modalCallback = null;
 }
 
-document.getElementById("modalConfirmBtn").addEventListener("click", () => {
-  if (modalCallback) modalCallback();
+document.getElementById("modalConfirmBtn").addEventListener("click", async () => {
+  if (modalCallback) {
+    try {
+      await modalCallback();
+    } catch (err) {
+      console.error("Error in modalCallback:", err);
+    }
+  }
   closeModal();
 });
 
@@ -1635,6 +1696,12 @@ async function createPoll() {
   });
 }
 
+// =====================================================
+// 🗳️ CERRAR VOTACIÓN, RULETA Y CREAR SEMANA
+// =====================================================
+
+let _pollWinner = null;
+
 async function closePoll() {
   showModal({
     icon: "🔒",
@@ -1644,15 +1711,241 @@ async function closePoll() {
     danger: true,
     onConfirm: async () => {
       try {
+        const pollDataSaved = JSON.parse(JSON.stringify(currentPoll));
         await post("/api/close-poll", {});
         toast("✓ Votación cerrada", "info");
         await loadPoll();
         if (currentUser.role === 'admin') renderAdminPoll();
+        setTimeout(() => showPollWinnerConfirmation(pollDataSaved), 300);
       } catch(err) {
+        console.error("❌ Error:", err);
         toast("Error al cerrar votación", "error");
       }
     }
   });
+}
+
+function showPollWinnerConfirmation(pollData) {
+  if (!pollData || !pollData.options || pollData.options.length === 0) {
+    toast("Error: no hay datos de votación", "error");
+    return;
+  }
+  const options = pollData.options;
+  const votes = pollData.votes || [];
+  const voteCount = {};
+  options.forEach(opt => { voteCount[opt.id] = votes.filter(v => v.option_id === opt.id).length; });
+  const maxVotes = Math.max(...options.map(opt => voteCount[opt.id] || 0));
+  const tied = options.filter(opt => (voteCount[opt.id] || 0) === maxVotes);
+
+  if (tied.length > 1) {
+    showRoulette(tied, voteCount);
+  } else {
+    const winnerOption = tied[0];
+    const homeTeam = teams.find(t => t.id === winnerOption.home_team_id);
+    const awayTeam = teams.find(t => t.id === winnerOption.away_team_id);
+    const winnerText = homeTeam && awayTeam ? `<strong>${homeTeam.name}</strong> vs <strong>${awayTeam.name}</strong>` : "Partido seleccionado";
+    const matchName = homeTeam && awayTeam ? `${homeTeam.name} - ${awayTeam.name}` : "";
+    showModal({
+      icon: "⚽",
+      title: "Ganador de la votación",
+      body: `<div style="text-align:center;padding:20px"><p style="font-size:14px;color:#999;margin-bottom:10px">El partido con más votos es:</p><p style="font-size:18px;margin:15px 0">${winnerText}</p><p style="font-size:12px;color:#666">Con <strong>${maxVotes}</strong> votos</p></div>`,
+      confirmText: "Sí, crear semana",
+      danger: false,
+      onConfirm: () => { _pollWinner = { winnerOption, matchName }; openCreateWeekPanel(matchName); }
+    });
+  }
+}
+
+function showRoulette(tiedOptions, voteCount) {
+  const overlay  = document.getElementById("rouletteOverlay");
+  const canvas   = document.getElementById("rouletteCanvas");
+  const spinBtn  = document.getElementById("rouletteSpinBtn");
+  const resultEl = document.getElementById("rouletteResult");
+  const items = tiedOptions.map(opt => {
+    const home = teams.find(t => t.id === opt.home_team_id);
+    const away = teams.find(t => t.id === opt.away_team_id);
+    return {
+      opt,
+      label: home && away ? `${home.name} - ${away.name}` : "Partido",
+      votes: voteCount[opt.id] || 0,
+      homeSlug: home ? home.slug : null,
+      awaySlug: away ? away.slug : null
+    };
+  });
+  const n = items.length;
+  const COLORS = ["#1a2535","#251a1a","#1a2520","#251a25","#25251a","#1a1a25","#251a20","#1a2525"];
+  const sliceAngle = (2 * Math.PI) / n;
+  let currentAngle = -Math.PI / 2;
+  let spinning = false;
+  const ctx = canvas.getContext("2d");
+  const R = canvas.width / 2;
+  const imgCache = {};
+
+  function loadImg(slug) {
+    if (!slug) return Promise.resolve(null);
+    if (imgCache[slug]) return Promise.resolve(imgCache[slug]);
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload  = () => { imgCache[slug] = img; resolve(img); };
+      img.onerror = () => { imgCache[slug] = null; resolve(null); };
+      img.src = `/Escudos/${slug}.svg`;
+    });
+  }
+
+  function drawShield(img, cx, cy, sz) {
+    if (img) {
+      ctx.drawImage(img, cx - sz / 2, cy - sz / 2, sz, sz);
+    } else {
+      ctx.beginPath(); ctx.arc(cx, cy, sz / 2, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff22"; ctx.fill();
+    }
+  }
+
+  function drawWheel(angle) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    items.forEach((item, i) => {
+      const start = angle + i * sliceAngle, end = start + sliceAngle;
+      const mid   = start + sliceAngle / 2;
+
+      // Sector
+      ctx.beginPath(); ctx.moveTo(R, R); ctx.arc(R, R, R - 4, start, end); ctx.closePath();
+      ctx.fillStyle = COLORS[i % COLORS.length]; ctx.fill();
+      ctx.strokeStyle = "#ffffff18"; ctx.lineWidth = 2; ctx.stroke();
+
+      // Escudos
+      const homeImg = imgCache[item.homeSlug] || null;
+      const awayImg = imgCache[item.awaySlug] || null;
+      const imgR = R * 0.60;
+      const cx = R + Math.cos(mid) * imgR;
+      const cy = R + Math.sin(mid) * imgR;
+      const maxSz = Math.min(36, (2 * Math.PI * imgR / n) * 0.75);
+
+      if (n <= 4) {
+        // Sectores grandes: dos escudos lado a lado perpendicular al radio
+        const sz = maxSz * 0.85;
+        const gap = sz * 0.6;
+        const nx = -Math.sin(mid), ny = Math.cos(mid); // perpendicular
+        drawShield(homeImg, cx - nx * gap, cy - ny * gap, sz);
+        drawShield(awayImg, cx + nx * gap, cy + ny * gap, sz);
+      } else {
+        // Sectores pequeños: escudos apilados en el radio
+        const sz = maxSz * 0.7;
+        const pr = R * 0.18; // separación en dirección radial
+        const px = Math.cos(mid), py = Math.sin(mid);
+        drawShield(homeImg, cx - px * pr, cy - py * pr, sz);
+        drawShield(awayImg, cx + px * pr, cy + py * pr, sz);
+      }
+
+      // Separador
+      ctx.beginPath(); ctx.moveTo(R, R);
+      ctx.lineTo(R + Math.cos(start) * (R - 4), R + Math.sin(start) * (R - 4));
+      ctx.strokeStyle = "#ffffff30"; ctx.lineWidth = 1.5; ctx.stroke();
+    });
+
+    // Aro exterior
+    ctx.beginPath(); ctx.arc(R, R, R - 3, 0, 2 * Math.PI);
+    ctx.strokeStyle = "#ffffff25"; ctx.lineWidth = 5; ctx.stroke();
+
+    // Centro
+    ctx.beginPath(); ctx.arc(R, R, 22, 0, 2 * Math.PI);
+    const grad = ctx.createRadialGradient(R - 5, R - 5, 0, R, R, 22);
+    grad.addColorStop(0, "#3a4050"); grad.addColorStop(1, "#0d1117");
+    ctx.fillStyle = grad; ctx.fill();
+    ctx.strokeStyle = "#ffffff35"; ctx.lineWidth = 2; ctx.stroke();
+
+    // Puntero
+    ctx.beginPath(); ctx.moveTo(R - 12, 6); ctx.lineTo(R + 12, 6); ctx.lineTo(R, 34); ctx.closePath();
+    ctx.fillStyle = "#fff"; ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 8;
+    ctx.fill(); ctx.shadowBlur = 0;
+  }
+
+  function spin() {
+    if (spinning) return;
+    spinning = true; spinBtn.disabled = true; resultEl.style.opacity = "0";
+    const totalRotation = (6 + Math.random() * 8) * 2 * Math.PI;
+    const duration = 4000 + Math.random() * 2000;
+    const start = performance.now(), startAngle = currentAngle;
+    function easeOut(t) { return 1 - Math.pow(1 - t, 4); }
+    function frame(now) {
+      const t = Math.min((now - start) / duration, 1);
+      currentAngle = startAngle + totalRotation * easeOut(t);
+      drawWheel(currentAngle);
+      if (t < 1) { requestAnimationFrame(frame); return; }
+      spinning = false;
+      const normalized = (((-currentAngle - Math.PI / 2) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      const winner = items[Math.floor(normalized / sliceAngle) % n];
+      resultEl.innerHTML = `🎉 <strong>${winner.label}</strong>`;
+      resultEl.style.opacity = "1";
+      spinBtn.textContent = "✅ Elegir este partido";
+      spinBtn.disabled = false;
+      spinBtn.onclick = () => {
+        overlay.classList.add("hidden");
+        _pollWinner = { winnerOption: winner.opt, matchName: winner.label };
+        openCreateWeekPanel(winner.label);
+      };
+      launchConfetti();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Reset UI y precargar imágenes
+  resultEl.style.opacity = "0"; resultEl.innerHTML = "";
+  spinBtn.textContent = "Cargando..."; spinBtn.disabled = true; spinBtn.onclick = spin;
+  document.getElementById("rouletteTied").textContent =
+    `Empate a ${items[0].votes} voto${items[0].votes !== 1 ? "s" : ""} · ${n} partidos en juego`;
+  overlay.classList.remove("hidden");
+
+  const slugs = [...new Set(items.flatMap(it => [it.homeSlug, it.awaySlug]).filter(Boolean))];
+  Promise.all(slugs.map(loadImg)).then(() => {
+    drawWheel(currentAngle);
+    spinBtn.textContent = "🎰 ¡GIRAR!";
+    spinBtn.disabled = false;
+  });
+}
+
+function launchConfetti() {
+  const container = document.getElementById("confettiContainer");
+  container.innerHTML = "";
+  const colors = ["#e63946","#f4a261","#2a9d8f","#e9c46a","#457b9d","#fff","#f77f00"];
+  for (let i = 0; i < 80; i++) {
+    const el = document.createElement("div");
+    el.className = "confetti-piece";
+    el.style.cssText = `left:${Math.random()*100}%;background:${colors[Math.floor(Math.random()*colors.length)]};width:${6+Math.random()*8}px;height:${6+Math.random()*8}px;animation-delay:${Math.random()*0.5}s;animation-duration:${1.2+Math.random()}s;border-radius:${Math.random()>0.5?"50%":"2px"};`;
+    container.appendChild(el);
+  }
+  setTimeout(() => { container.innerHTML = ""; }, 3000);
+}
+
+function openCreateWeekPanel(matchName) {
+  document.getElementById("cwpMatchName").textContent = matchName;
+  document.getElementById("cwpRound").value = "";
+  document.getElementById("cwpDate").value = "";
+  document.getElementById("createWeekPollOverlay").classList.remove("hidden");
+}
+
+async function submitCreateWeekFromPoll() {
+  const round = (document.getElementById("cwpRound").value || "").trim();
+  const matchDate = document.getElementById("cwpDate").value || "";
+  if (!round) { toast("Indica la jornada", "error"); return; }
+  if (!_pollWinner) { toast("Error: no hay partido seleccionado", "error"); return; }
+  const { winnerOption, matchName } = _pollWinner;
+  try {
+    const data = await post("/api/create-week-from-poll", {
+      home_team_id: winnerOption.home_team_id,
+      away_team_id: winnerOption.away_team_id,
+      round_number: round,
+      match_name: matchName || null,
+      match_date: matchDate || null
+    });
+    if (data.error) { toast(data.error, "error"); }
+    else {
+      document.getElementById("createWeekPollOverlay").classList.add("hidden");
+      _pollWinner = null;
+      toast("✓ Semana creada desde votación", "success");
+      loadData();
+    }
+  } catch (err) { toast("Error: " + err.message, "error"); }
 }
 
 function renderAdminPoll() {
